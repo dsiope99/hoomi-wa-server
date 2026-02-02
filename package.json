@@ -19,6 +19,6 @@
     "jsonwebtoken": "^8.5.1"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   }
 }
