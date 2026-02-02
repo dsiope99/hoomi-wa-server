@@ -1,6 +1,7 @@
 // ============================================
 // BACKEND NODE.JS - WHATSAPP WEB CON BAILEYS
 // USANDO SUPABASE PARA ALMACENAR SESIONES
+// VERSIÓN ARREGLADA - MANEJA ERRORES CORRECTAMENTE
 // ============================================
 
 const express = require('express');
@@ -47,70 +48,140 @@ const wsClients = new Map();
 const initializingUsers = new Set();
 
 // ============================================
-// CUSTOM AUTH STATE PROVIDER (SUPABASE)
+// FUNCIONES AUXILIARES PARA SUPABASE
 // ============================================
 
-async function createSupabaseAuthState(asesorId) {
-  logger.info(`📦 Creando auth state para ${asesorId}`);
+async function getOrCreateAuthState(asesorId) {
+  try {
+    logger.info(`📦 Obteniendo o creando auth state para ${asesorId}`);
 
-  // Obtener estado previo de Supabase
-  const { data: existing } = await supabase
-    .from('whatsapp_auth_state')
-    .select('auth_state')
-    .eq('asesor_id', asesorId)
-    .single();
+    // Intentar obtener registro existente
+    const { data, error } = await supabase
+      .from('whatsapp_auth_state')
+      .select('auth_state')
+      .eq('asesor_id', asesorId)
+      .maybeSingle(); // Retorna null si no existe, no error
 
-  const initialState = existing?.auth_state || {};
+    if (error && error.code !== 'PGRST116') {
+      logger.error(`❌ Error obteniendo auth state: ${error.message}`);
+      throw error;
+    }
 
-  return {
-    creds: initialState.creds || null,
-    keys: initialState.keys || {},
+    // Si existe, retornar estado previo
+    if (data?.auth_state) {
+      logger.info(`✅ Auth state cargado de Supabase para ${asesorId}`);
+      return data.auth_state;
+    }
 
-    // Guardar credenciales
-    saveCreds: async () => {
-      try {
-        const state = {
-          creds: this.creds,
-          keys: this.keys,
-        };
+    // Si no existe, crear registro nuevo
+    logger.info(`📝 Creando registro nuevo en Supabase para ${asesorId}`);
+    const initialState = { creds: null, keys: {} };
 
-        await supabase
-          .from('whatsapp_auth_state')
-          .upsert({
-            asesor_id: asesorId,
-            auth_state: state,
-            updated_at: new Date(),
-          }, { onConflict: 'asesor_id' });
+    const { error: insertError } = await supabase
+      .from('whatsapp_auth_state')
+      .upsert({
+        asesor_id: asesorId,
+        auth_state: initialState,
+        status: 'initializing',
+        created_at: new Date(),
+        updated_at: new Date(),
+      }, { onConflict: 'asesor_id' });
 
-        logger.info(`💾 Credenciales guardadas para ${asesorId}`);
-      } catch (error) {
-        logger.error(`❌ Error guardando credenciales: ${error.message}`);
-      }
-    },
+    if (insertError) {
+      logger.error(`❌ Error creando registro: ${insertError.message}`);
+      throw insertError;
+    }
 
-    // Cargar credenciales
-    loadCreds: async () => {
-      try {
-        const { data } = await supabase
-          .from('whatsapp_auth_state')
-          .select('auth_state')
-          .eq('asesor_id', asesorId)
-          .single();
+    logger.info(`✅ Registro creado para ${asesorId}`);
+    return initialState;
+  } catch (error) {
+    logger.error(`❌ Error en getOrCreateAuthState: ${error.message}`);
+    throw error;
+  }
+}
 
-        if (data?.auth_state) {
-          this.creds = data.auth_state.creds;
-          this.keys = data.auth_state.keys;
-          logger.info(`📂 Credenciales cargadas para ${asesorId}`);
-        }
-      } catch (error) {
-        logger.error(`❌ Error cargando credenciales: ${error.message}`);
-      }
-    },
-  };
+async function saveAuthState(asesorId, state) {
+  try {
+    logger.info(`💾 Guardando auth state para ${asesorId}`);
+
+    const { error } = await supabase
+      .from('whatsapp_auth_state')
+      .update({
+        auth_state: state,
+        updated_at: new Date(),
+      })
+      .eq('asesor_id', asesorId);
+
+    if (error) {
+      logger.error(`❌ Error guardando auth state: ${error.message}`);
+      throw error;
+    }
+
+    logger.info(`✅ Auth state guardado para ${asesorId}`);
+  } catch (error) {
+    logger.error(`❌ Error en saveAuthState: ${error.message}`);
+  }
+}
+
+async function saveQRToSupabase(asesorId, qrImage) {
+  try {
+    logger.info(`📱 Guardando QR en Supabase para ${asesorId}`);
+
+    const { error } = await supabase
+      .from('whatsapp_auth_state')
+      .update({
+        qr_code: qrImage,
+        status: 'waiting_for_scan',
+        updated_at: new Date(),
+      })
+      .eq('asesor_id', asesorId);
+
+    if (error) {
+      logger.error(`❌ Error guardando QR: ${error.message}`);
+      throw error;
+    }
+
+    logger.info(`✅ QR guardado en Supabase para ${asesorId}`);
+  } catch (error) {
+    logger.error(`❌ Error en saveQRToSupabase: ${error.message}`);
+  }
+}
+
+async function updateConnectionStatus(asesorId, status, phone = null) {
+  try {
+    logger.info(`📊 Actualizando estado a '${status}' para ${asesorId}`);
+
+    const updateData = {
+      status,
+      updated_at: new Date(),
+    };
+
+    if (phone) {
+      updateData.phone = phone;
+    }
+
+    if (status === 'connected') {
+      updateData.qr_code = null; // Limpiar QR cuando se conecta
+    }
+
+    const { error } = await supabase
+      .from('whatsapp_auth_state')
+      .update(updateData)
+      .eq('asesor_id', asesorId);
+
+    if (error) {
+      logger.error(`❌ Error actualizando estado: ${error.message}`);
+      throw error;
+    }
+
+    logger.info(`✅ Estado actualizado para ${asesorId}`);
+  } catch (error) {
+    logger.error(`❌ Error en updateConnectionStatus: ${error.message}`);
+  }
 }
 
 // ============================================
-// FUNCIONES AUXILIARES
+// INICIALIZAR WHATSAPP
 // ============================================
 
 async function initializeWhatsApp(userId) {
@@ -123,12 +194,30 @@ async function initializeWhatsApp(userId) {
     initializingUsers.add(userId);
     logger.info(`🔄 Inicializando WhatsApp para usuario: ${userId}`);
 
-    // Crear auth state con Supabase
-    const authState = await createSupabaseAuthState(userId);
-    await authState.loadCreds();
+    // Obtener o crear auth state
+    const authState = await getOrCreateAuthState(userId);
 
+    // Crear objeto de estado compatible con Baileys
+    const state = {
+      creds: authState.creds,
+      keys: authState.keys || {},
+    };
+
+    // Función para guardar credenciales
+    const saveCreds = async () => {
+      try {
+        logger.info(`💾 Guardando credenciales para ${userId}`);
+        await saveAuthState(userId, state);
+      } catch (error) {
+        logger.error(`❌ Error guardando credenciales: ${error.message}`);
+      }
+    };
+
+    logger.info(`✅ Auth state preparado para ${userId}`);
+
+    // Inicializar Baileys
     const sock = makeWASocket({
-      auth: authState,
+      auth: state,
       printQRInTerminal: false,
       logger: pino({ level: 'silent' }),
       browser: ['Hoomi CRM', 'Safari', '1.0.0'],
@@ -164,18 +253,7 @@ async function initializeWhatsApp(userId) {
         qrGenerated = true;
         try {
           const qrImage = await QRCode.toDataURL(qr);
-          
-          // Guardar QR en Supabase
-          await supabase
-            .from('whatsapp_auth_state')
-            .update({
-              qr_code: qrImage,
-              status: 'waiting_for_scan',
-              updated_at: new Date(),
-            })
-            .eq('asesor_id', userId);
-
-          logger.info(`✅ QR guardado en Supabase para ${userId}`);
+          await saveQRToSupabase(userId, qrImage);
           
           // Notificar al frontend
           broadcastToUser(userId, {
@@ -189,28 +267,11 @@ async function initializeWhatsApp(userId) {
 
       if (connection === 'open') {
         logger.info(`✅ WhatsApp conectado para ${userId}`);
+        qrGenerated = true;
         initializingUsers.delete(userId);
         
-        // Actualizar estado en Supabase
         try {
-          await supabase
-            .from('whatsapp_auth_state')
-            .update({
-              status: 'connected',
-              phone: sock.user?.id || 'unknown',
-              qr_code: null,
-              updated_at: new Date(),
-            })
-            .eq('asesor_id', userId);
-
-          // También guardar en whatsapp_sessions
-          await supabase.from('whatsapp_sessions').upsert({
-            asesor_id: userId,
-            status: 'connected',
-            phone: sock.user?.id || 'unknown',
-            last_activity: new Date(),
-          });
-
+          await updateConnectionStatus(userId, 'connected', sock.user?.id);
           logger.info(`💾 Sesión guardada para ${userId}`);
         } catch (error) {
           logger.error(`❌ Error guardando sesión: ${error.message}`);
@@ -242,14 +303,7 @@ async function initializeWhatsApp(userId) {
           initializingUsers.delete(userId);
           
           try {
-            await supabase
-              .from('whatsapp_auth_state')
-              .update({
-                status: 'disconnected',
-                qr_code: null,
-                updated_at: new Date(),
-              })
-              .eq('asesor_id', userId);
+            await updateConnectionStatus(userId, 'disconnected');
           } catch (error) {
             logger.error(`❌ Error actualizando estado: ${error.message}`);
           }
@@ -258,13 +312,7 @@ async function initializeWhatsApp(userId) {
     });
 
     // Evento: Credenciales actualizadas
-    sock.ev.on('creds.update', async () => {
-      try {
-        await authState.saveCreds();
-      } catch (error) {
-        logger.error(`❌ Error guardando credenciales: ${error.message}`);
-      }
-    });
+    sock.ev.on('creds.update', saveCreds);
 
     // Evento: Mensaje recibido
     sock.ev.on('messages.upsert', async (m) => {
@@ -313,7 +361,6 @@ async function initializeWhatsApp(userId) {
   } catch (error) {
     logger.error(`❌ Error inicializando WhatsApp para ${userId}:`, error.message);
     initializingUsers.delete(userId);
-    throw error;
   }
 }
 
@@ -385,12 +432,17 @@ app.get('/api/whatsapp/qr/:userId', async (req, res) => {
       .from('whatsapp_auth_state')
       .select('qr_code, status')
       .eq('asesor_id', userId)
-      .single();
+      .maybeSingle(); // Retorna null si no existe, no error
 
-    if (error || !data) {
-      logger.warn(`⚠️ QR no disponible para ${userId}`);
+    if (error && error.code !== 'PGRST116') {
+      logger.error(`❌ Error obteniendo QR: ${error.message}`);
+      return res.status(500).json({ error: error.message });
+    }
+
+    if (!data) {
+      logger.warn(`⚠️ Registro no encontrado para ${userId}`);
       return res.status(404).json({ 
-        error: 'QR no disponible',
+        error: 'Registro no encontrado',
         initializing: initializingUsers.has(userId)
       });
     }
@@ -519,7 +571,11 @@ app.get('/api/whatsapp/status/:userId', async (req, res) => {
       .from('whatsapp_auth_state')
       .select('status, phone, qr_code')
       .eq('asesor_id', userId)
-      .single();
+      .maybeSingle();
+
+    if (error && error.code !== 'PGRST116') {
+      return res.status(500).json({ error: error.message });
+    }
 
     const isActive = activeSessions.has(userId);
     const isInitializing = initializingUsers.has(userId);
@@ -551,14 +607,7 @@ app.post('/api/whatsapp/disconnect', async (req, res) => {
     initializingUsers.delete(userId);
 
     try {
-      await supabase
-        .from('whatsapp_auth_state')
-        .update({
-          status: 'disconnected',
-          qr_code: null,
-          updated_at: new Date(),
-        })
-        .eq('asesor_id', userId);
+      await updateConnectionStatus(userId, 'disconnected');
     } catch (error) {
       logger.error(`❌ Error actualizando estado: ${error.message}`);
     }
