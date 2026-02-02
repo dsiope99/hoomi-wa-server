@@ -1,6 +1,6 @@
 // ============================================
 // BACKEND NODE.JS - WHATSAPP WEB CON BAILEYS
-// VERSIÓN ARREGLADA Y SIMPLIFICADA
+// USANDO SUPABASE PARA ALMACENAR SESIONES
 // ============================================
 
 const express = require('express');
@@ -9,10 +9,8 @@ const bodyParser = require('body-parser');
 const dotenv = require('dotenv');
 const { createClient } = require('@supabase/supabase-js');
 const makeWASocket = require('@whiskeysockets/baileys').default;
-const { useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { DisconnectReason } = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
-const fs = require('fs');
-const path = require('path');
 const http = require('http');
 const WebSocket = require('ws');
 const pino = require('pino');
@@ -32,25 +30,84 @@ app.use(cors({
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
 
-// Logger simple
+// Logger
 const logger = pino({ level: 'info' });
 
 // Supabase
-let supabase;
-try {
-  supabase = createClient(
-    process.env.SUPABASE_URL,
-    process.env.SUPABASE_KEY
-  );
-  logger.info('✅ Supabase conectado');
-} catch (error) {
-  logger.error('❌ Error conectando Supabase:', error.message);
-}
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_KEY
+);
+
+logger.info('✅ Supabase inicializado');
 
 // Almacenar sesiones activas
 const activeSessions = new Map();
-const qrCodes = new Map();
 const wsClients = new Map();
+const initializingUsers = new Set();
+
+// ============================================
+// CUSTOM AUTH STATE PROVIDER (SUPABASE)
+// ============================================
+
+async function createSupabaseAuthState(asesorId) {
+  logger.info(`📦 Creando auth state para ${asesorId}`);
+
+  // Obtener estado previo de Supabase
+  const { data: existing } = await supabase
+    .from('whatsapp_auth_state')
+    .select('auth_state')
+    .eq('asesor_id', asesorId)
+    .single();
+
+  const initialState = existing?.auth_state || {};
+
+  return {
+    creds: initialState.creds || null,
+    keys: initialState.keys || {},
+
+    // Guardar credenciales
+    saveCreds: async () => {
+      try {
+        const state = {
+          creds: this.creds,
+          keys: this.keys,
+        };
+
+        await supabase
+          .from('whatsapp_auth_state')
+          .upsert({
+            asesor_id: asesorId,
+            auth_state: state,
+            updated_at: new Date(),
+          }, { onConflict: 'asesor_id' });
+
+        logger.info(`💾 Credenciales guardadas para ${asesorId}`);
+      } catch (error) {
+        logger.error(`❌ Error guardando credenciales: ${error.message}`);
+      }
+    },
+
+    // Cargar credenciales
+    loadCreds: async () => {
+      try {
+        const { data } = await supabase
+          .from('whatsapp_auth_state')
+          .select('auth_state')
+          .eq('asesor_id', asesorId)
+          .single();
+
+        if (data?.auth_state) {
+          this.creds = data.auth_state.creds;
+          this.keys = data.auth_state.keys;
+          logger.info(`📂 Credenciales cargadas para ${asesorId}`);
+        }
+      } catch (error) {
+        logger.error(`❌ Error cargando credenciales: ${error.message}`);
+      }
+    },
+  };
+}
 
 // ============================================
 // FUNCIONES AUXILIARES
@@ -58,25 +115,45 @@ const wsClients = new Map();
 
 async function initializeWhatsApp(userId) {
   try {
-    logger.info(`🔄 Inicializando WhatsApp para usuario: ${userId}`);
-
-    const sessionPath = path.join(__dirname, `sessions/${userId}`);
-    
-    // Crear carpeta si no existe
-    if (!fs.existsSync(sessionPath)) {
-      fs.mkdirSync(sessionPath, { recursive: true });
-      logger.info(`📁 Carpeta de sesión creada: ${sessionPath}`);
+    if (initializingUsers.has(userId)) {
+      logger.warn(`⚠️ Ya se está inicializando para ${userId}`);
+      return;
     }
 
-    const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+    initializingUsers.add(userId);
+    logger.info(`🔄 Inicializando WhatsApp para usuario: ${userId}`);
+
+    // Crear auth state con Supabase
+    const authState = await createSupabaseAuthState(userId);
+    await authState.loadCreds();
 
     const sock = makeWASocket({
-      auth: state,
+      auth: authState,
       printQRInTerminal: false,
       logger: pino({ level: 'silent' }),
       browser: ['Hoomi CRM', 'Safari', '1.0.0'],
+      
+      // OPTIMIZACIONES PARA SERVERLESS
       syncFullHistory: false,
+      markOnlineOnConnect: true,
+      shouldSyncHistoryMessage: () => false,
+      generateHighQualityLinkPreview: false,
+      
+      // TIMEOUTS AUMENTADOS
+      qrTimeout: 120000, // 2 minutos
+      connectTimeoutMs: 120000,
+      defaultQueryTimeoutMs: 0,
+      
+      // KEEP-ALIVE
+      keepAliveIntervalMs: 30000,
+      emitOwnEvents: true,
+      
+      // RETRIES
+      retryRequestDelayMs: 250,
+      maxRetries: 5,
     });
+
+    let qrGenerated = false;
 
     // Evento: Actualización de conexión
     sock.ev.on('connection.update', async (update) => {
@@ -84,10 +161,21 @@ async function initializeWhatsApp(userId) {
 
       if (qr) {
         logger.info(`📱 QR generado para ${userId}`);
+        qrGenerated = true;
         try {
           const qrImage = await QRCode.toDataURL(qr);
-          qrCodes.set(userId, qrImage);
-          logger.info(`✅ QR guardado en memoria para ${userId}`);
+          
+          // Guardar QR en Supabase
+          await supabase
+            .from('whatsapp_auth_state')
+            .update({
+              qr_code: qrImage,
+              status: 'waiting_for_scan',
+              updated_at: new Date(),
+            })
+            .eq('asesor_id', userId);
+
+          logger.info(`✅ QR guardado en Supabase para ${userId}`);
           
           // Notificar al frontend
           broadcastToUser(userId, {
@@ -101,21 +189,31 @@ async function initializeWhatsApp(userId) {
 
       if (connection === 'open') {
         logger.info(`✅ WhatsApp conectado para ${userId}`);
-        qrCodes.delete(userId);
+        initializingUsers.delete(userId);
         
-        // Guardar sesión en Supabase
-        if (supabase) {
-          try {
-            await supabase.from('whatsapp_sessions').upsert({
-              asesor_id: userId,
+        // Actualizar estado en Supabase
+        try {
+          await supabase
+            .from('whatsapp_auth_state')
+            .update({
               status: 'connected',
               phone: sock.user?.id || 'unknown',
-              last_activity: new Date(),
-            });
-            logger.info(`💾 Sesión guardada en Supabase para ${userId}`);
-          } catch (error) {
-            logger.error(`❌ Error guardando sesión en Supabase: ${error.message}`);
-          }
+              qr_code: null,
+              updated_at: new Date(),
+            })
+            .eq('asesor_id', userId);
+
+          // También guardar en whatsapp_sessions
+          await supabase.from('whatsapp_sessions').upsert({
+            asesor_id: userId,
+            status: 'connected',
+            phone: sock.user?.id || 'unknown',
+            last_activity: new Date(),
+          });
+
+          logger.info(`💾 Sesión guardada para ${userId}`);
+        } catch (error) {
+          logger.error(`❌ Error guardando sesión: ${error.message}`);
         }
 
         broadcastToUser(userId, {
@@ -130,28 +228,43 @@ async function initializeWhatsApp(userId) {
           lastDisconnect?.error?.output?.statusCode !==
           DisconnectReason.loggedOut;
 
-        if (shouldReconnect) {
+        if (shouldReconnect && qrGenerated) {
           logger.info(`🔄 Reconectando ${userId}...`);
-          setTimeout(() => initializeWhatsApp(userId), 3000);
+          initializingUsers.delete(userId);
+          setTimeout(() => initializeWhatsApp(userId), 5000);
+        } else if (!qrGenerated) {
+          logger.warn(`⚠️ QR no se generó, reintentando...`);
+          initializingUsers.delete(userId);
+          setTimeout(() => initializeWhatsApp(userId), 5000);
         } else {
           logger.info(`❌ Sesión cerrada para ${userId}`);
           activeSessions.delete(userId);
+          initializingUsers.delete(userId);
           
-          if (supabase) {
-            try {
-              await supabase.from('whatsapp_sessions').update({
+          try {
+            await supabase
+              .from('whatsapp_auth_state')
+              .update({
                 status: 'disconnected',
-              }).eq('asesor_id', userId);
-            } catch (error) {
-              logger.error(`❌ Error actualizando sesión: ${error.message}`);
-            }
+                qr_code: null,
+                updated_at: new Date(),
+              })
+              .eq('asesor_id', userId);
+          } catch (error) {
+            logger.error(`❌ Error actualizando estado: ${error.message}`);
           }
         }
       }
     });
 
     // Evento: Credenciales actualizadas
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', async () => {
+      try {
+        await authState.saveCreds();
+      } catch (error) {
+        logger.error(`❌ Error guardando credenciales: ${error.message}`);
+      }
+    });
 
     // Evento: Mensaje recibido
     sock.ev.on('messages.upsert', async (m) => {
@@ -166,22 +279,20 @@ async function initializeWhatsApp(userId) {
 
           const phone = message.key.remoteJid.split('@')[0];
 
-          logger.info(`📨 Mensaje recibido de ${phone}: ${text.substring(0, 50)}`);
+          logger.info(`📨 Mensaje recibido de ${phone}`);
 
           // Guardar en Supabase
-          if (supabase) {
-            try {
-              await supabase.from('whatsapp_messages').insert({
-                asesor_id: userId,
-                phone,
-                message: text,
-                direction: 'incoming',
-                timestamp: new Date(message.messageTimestamp * 1000),
-                status: 'received',
-              });
-            } catch (error) {
-              logger.error(`❌ Error guardando mensaje: ${error.message}`);
-            }
+          try {
+            await supabase.from('whatsapp_messages').insert({
+              asesor_id: userId,
+              phone,
+              message: text,
+              direction: 'incoming',
+              timestamp: new Date(message.messageTimestamp * 1000),
+              status: 'received',
+            });
+          } catch (error) {
+            logger.error(`❌ Error guardando mensaje: ${error.message}`);
           }
 
           // Notificar al frontend
@@ -199,9 +310,9 @@ async function initializeWhatsApp(userId) {
 
     activeSessions.set(userId, sock);
     logger.info(`✅ WhatsApp inicializado para ${userId}`);
-    return sock;
   } catch (error) {
     logger.error(`❌ Error inicializando WhatsApp para ${userId}:`, error.message);
+    initializingUsers.delete(userId);
     throw error;
   }
 }
@@ -215,7 +326,7 @@ function broadcastToUser(userId, data) {
     }
   });
   if (count > 0) {
-    logger.info(`📡 Broadcast enviado a ${count} cliente(s) de ${userId}`);
+    logger.info(`📡 Broadcast enviado a ${count} cliente(s)`);
   }
 }
 
@@ -225,11 +336,9 @@ function broadcastToUser(userId, data) {
 
 // Health Check
 app.get('/api/health', (req, res) => {
-  logger.info('🏥 Health check');
   res.json({
     status: 'ok',
     timestamp: new Date(),
-    supabase: supabase ? 'connected' : 'disconnected',
   });
 });
 
@@ -241,7 +350,6 @@ app.post('/api/whatsapp/init', async (req, res) => {
     logger.info(`📞 POST /api/whatsapp/init - userId: ${userId}`);
 
     if (!userId) {
-      logger.warn('⚠️ userId no proporcionado');
       return res.status(400).json({ error: 'userId requerido' });
     }
 
@@ -250,9 +358,15 @@ app.post('/api/whatsapp/init', async (req, res) => {
       return res.status(400).json({ error: 'Sesión ya activa' });
     }
 
-    await initializeWhatsApp(userId);
-    logger.info(`✅ Inicialización enviada para ${userId}`);
-    res.json({ success: true, message: 'Inicializando WhatsApp...' });
+    // Iniciar en background
+    initializeWhatsApp(userId).catch(error => {
+      logger.error(`❌ Error en inicialización: ${error.message}`);
+    });
+
+    res.json({ 
+      success: true, 
+      message: 'Inicializando WhatsApp... Por favor espera hasta 2 minutos para que aparezca el QR.' 
+    });
   } catch (error) {
     logger.error(`❌ Error en /api/whatsapp/init: ${error.message}`);
     res.status(500).json({ error: error.message });
@@ -266,15 +380,32 @@ app.get('/api/whatsapp/qr/:userId', async (req, res) => {
 
     logger.info(`📱 GET /api/whatsapp/qr/:${userId}`);
 
-    const qr = qrCodes.get(userId);
+    // Obtener QR de Supabase
+    const { data, error } = await supabase
+      .from('whatsapp_auth_state')
+      .select('qr_code, status')
+      .eq('asesor_id', userId)
+      .single();
 
-    if (!qr) {
+    if (error || !data) {
       logger.warn(`⚠️ QR no disponible para ${userId}`);
-      return res.status(404).json({ error: 'QR no disponible' });
+      return res.status(404).json({ 
+        error: 'QR no disponible',
+        initializing: initializingUsers.has(userId)
+      });
+    }
+
+    if (!data.qr_code) {
+      logger.warn(`⚠️ QR aún no generado para ${userId}`);
+      return res.status(404).json({ 
+        error: 'QR aún no generado',
+        status: data.status,
+        initializing: initializingUsers.has(userId)
+      });
     }
 
     logger.info(`✅ QR retornado para ${userId}`);
-    res.json({ qr });
+    res.json({ qr: data.qr_code });
   } catch (error) {
     logger.error(`❌ Error en /api/whatsapp/qr: ${error.message}`);
     res.status(500).json({ error: error.message });
@@ -286,16 +417,12 @@ app.post('/api/whatsapp/send', async (req, res) => {
   try {
     const { userId, phone, message } = req.body;
 
-    logger.info(`💬 POST /api/whatsapp/send - userId: ${userId}, phone: ${phone}`);
-
     if (!userId || !phone || !message) {
-      logger.warn('⚠️ Parámetros incompletos');
       return res.status(400).json({ error: 'Parámetros requeridos' });
     }
 
     const sock = activeSessions.get(userId);
     if (!sock) {
-      logger.warn(`⚠️ Sesión no activa para ${userId}`);
       return res.status(400).json({ error: 'Sesión no activa' });
     }
 
@@ -305,19 +432,17 @@ app.post('/api/whatsapp/send', async (req, res) => {
     logger.info(`✅ Mensaje enviado a ${phone}`);
 
     // Guardar en Supabase
-    if (supabase) {
-      try {
-        await supabase.from('whatsapp_messages').insert({
-          asesor_id: userId,
-          phone,
-          message,
-          direction: 'outgoing',
-          timestamp: new Date(),
-          status: 'sent',
-        });
-      } catch (error) {
-        logger.error(`❌ Error guardando mensaje: ${error.message}`);
-      }
+    try {
+      await supabase.from('whatsapp_messages').insert({
+        asesor_id: userId,
+        phone,
+        message,
+        direction: 'outgoing',
+        timestamp: new Date(),
+        status: 'sent',
+      });
+    } catch (error) {
+      logger.error(`❌ Error guardando mensaje: ${error.message}`);
     }
 
     res.json({ success: true });
@@ -332,12 +457,6 @@ app.get('/api/whatsapp/messages/:userId/:phone', async (req, res) => {
   try {
     const { userId, phone } = req.params;
 
-    logger.info(`📨 GET /api/whatsapp/messages - userId: ${userId}, phone: ${phone}`);
-
-    if (!supabase) {
-      return res.status(500).json({ error: 'Supabase no conectado' });
-    }
-
     const { data: messages, error } = await supabase
       .from('whatsapp_messages')
       .select('*')
@@ -346,11 +465,9 @@ app.get('/api/whatsapp/messages/:userId/:phone', async (req, res) => {
       .order('timestamp', { ascending: true });
 
     if (error) {
-      logger.error(`❌ Error obteniendo mensajes: ${error.message}`);
       return res.status(500).json({ error: error.message });
     }
 
-    logger.info(`✅ ${messages.length} mensajes retornados`);
     res.json({ messages });
   } catch (error) {
     logger.error(`❌ Error en /api/whatsapp/messages: ${error.message}`);
@@ -363,12 +480,6 @@ app.get('/api/whatsapp/conversations/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
 
-    logger.info(`💬 GET /api/whatsapp/conversations - userId: ${userId}`);
-
-    if (!supabase) {
-      return res.status(500).json({ error: 'Supabase no conectado' });
-    }
-
     const { data: messages, error } = await supabase
       .from('whatsapp_messages')
       .select('phone, message, timestamp, direction')
@@ -376,7 +487,6 @@ app.get('/api/whatsapp/conversations/:userId', async (req, res) => {
       .order('timestamp', { ascending: false });
 
     if (error) {
-      logger.error(`❌ Error obteniendo conversaciones: ${error.message}`);
       return res.status(500).json({ error: error.message });
     }
 
@@ -393,7 +503,6 @@ app.get('/api/whatsapp/conversations/:userId', async (req, res) => {
       }
     });
 
-    logger.info(`✅ ${Object.keys(conversations).length} conversaciones retornadas`);
     res.json({ conversations: Object.values(conversations) });
   } catch (error) {
     logger.error(`❌ Error en /api/whatsapp/conversations: ${error.message}`);
@@ -406,28 +515,21 @@ app.get('/api/whatsapp/status/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
 
-    logger.info(`📊 GET /api/whatsapp/status - userId: ${userId}`);
-
-    if (!supabase) {
-      return res.status(500).json({ error: 'Supabase no conectado' });
-    }
-
     const { data: session, error } = await supabase
-      .from('whatsapp_sessions')
-      .select('*')
+      .from('whatsapp_auth_state')
+      .select('status, phone, qr_code')
       .eq('asesor_id', userId)
       .single();
 
-    const hasQR = qrCodes.has(userId);
     const isActive = activeSessions.has(userId);
-
-    logger.info(`✅ Estado: hasQR=${hasQR}, isActive=${isActive}`);
+    const isInitializing = initializingUsers.has(userId);
 
     res.json({
       status: session?.status || 'disconnected',
       phone: session?.phone,
-      hasQR,
+      hasQR: !!session?.qr_code,
       isActive,
+      isInitializing,
     });
   } catch (error) {
     logger.error(`❌ Error en /api/whatsapp/status: ${error.message}`);
@@ -440,25 +542,25 @@ app.post('/api/whatsapp/disconnect', async (req, res) => {
   try {
     const { userId } = req.body;
 
-    logger.info(`🔌 POST /api/whatsapp/disconnect - userId: ${userId}`);
-
     const sock = activeSessions.get(userId);
     if (sock) {
       await sock.logout();
       activeSessions.delete(userId);
-      logger.info(`✅ Sesión cerrada para ${userId}`);
     }
 
-    qrCodes.delete(userId);
+    initializingUsers.delete(userId);
 
-    if (supabase) {
-      try {
-        await supabase.from('whatsapp_sessions').update({
+    try {
+      await supabase
+        .from('whatsapp_auth_state')
+        .update({
           status: 'disconnected',
-        }).eq('asesor_id', userId);
-      } catch (error) {
-        logger.error(`❌ Error actualizando sesión: ${error.message}`);
-      }
+          qr_code: null,
+          updated_at: new Date(),
+        })
+        .eq('asesor_id', userId);
+    } catch (error) {
+      logger.error(`❌ Error actualizando estado: ${error.message}`);
     }
 
     res.json({ success: true });
@@ -517,6 +619,7 @@ server.listen(PORT, () => {
 ║   🚀 HOOMI CRM - WHATSAPP BACKEND      ║
 ║   Servidor escuchando en puerto ${PORT}      ║
 ║   Ambiente: ${process.env.NODE_ENV || 'development'}           ║
+║   ✅ Usando Supabase para sesiones     ║
 ╚════════════════════════════════════════╝
   `);
 });
